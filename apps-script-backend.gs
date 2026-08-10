@@ -69,7 +69,7 @@ function getSheet(name, headers) {
   return sh;
 }
 
-function teamsSheet() { return getSheet(SHEET_NAMES.teams, ['id', 'name', 'past', 'present', 'future']); }
+function teamsSheet() { return getSheet(SHEET_NAMES.teams, ['id', 'name', 'past', 'present', 'future', 'teamId', 'contact']); }
 function stallsSheet() { return getSheet(SHEET_NAMES.stalls, ['id', 'name', 'category', 'minWager']); }
 function matchesSheet() {
   return getSheet(SHEET_NAMES.matches, [
@@ -103,8 +103,8 @@ function addTeam(p) {
   lock.waitLock(10000);
   try {
     const sh = teamsSheet();
-    const id = 't_' + new Date().getTime() + '_' + Math.floor(Math.random() * 1000);
-    sh.appendRow([id, p.name, Number(p.past) || 0, Number(p.present) || 0, Number(p.future) || 0]);
+    const id = p.id || ('t_' + new Date().getTime() + '_' + Math.floor(Math.random() * 1000));
+    sh.appendRow([id, p.name, Number(p.past) || 0, Number(p.present) || 0, Number(p.future) || 0, p.teamId || '', p.contact || '']);
     return { ok: true, id: id };
   } finally { lock.releaseLock(); }
 }

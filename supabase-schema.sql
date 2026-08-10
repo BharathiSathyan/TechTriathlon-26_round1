@@ -6,12 +6,18 @@
 -- 1. Create Teams Table
 CREATE TABLE IF NOT EXISTS public.teams (
   id TEXT PRIMARY KEY,
+  team_id TEXT DEFAULT '',
   name TEXT NOT NULL,
+  contact TEXT DEFAULT '',
   past INT NOT NULL DEFAULT 9,
   present INT NOT NULL DEFAULT 6,
   future INT NOT NULL DEFAULT 4,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Migrations for existing deployments
+ALTER TABLE public.teams ADD COLUMN IF NOT EXISTS team_id TEXT DEFAULT '';
+ALTER TABLE public.teams ADD COLUMN IF NOT EXISTS contact TEXT DEFAULT '';
 
 -- 2. Create Stalls Table
 CREATE TABLE IF NOT EXISTS public.stalls (

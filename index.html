@@ -125,6 +125,8 @@ const MAX_ENCOUNTERS = 3;
 // ---- IMPORT FIELD MAP ----
 const IMPORT_FIELDS = {
   name:    'Name',     
+  teamId:  'Team ID',  
+  contact: 'Contact',  
   past:    'Past',     
   present: 'Present',  
   future:  'Future'    
@@ -190,9 +192,12 @@ function bgSyncSheet(action, payload) {
 async function dbAddTeam(p) {
   bgSyncSheet('addTeam', p);
   if (supabaseClient) {
-    const id = 't_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const id = p.id || ('t_' + Date.now() + '_' + Math.floor(Math.random() * 1000));
     const { error } = await supabaseClient.from('teams').insert([{
-      id, name: p.name,
+      id,
+      team_id: p.teamId || '',
+      name: p.name,
+      contact: p.contact || '',
       past: Number(p.past)||0, present: Number(p.present)||0, future: Number(p.future)||0
     }]);
     if (error) throw new Error(error.message);
@@ -205,8 +210,10 @@ async function dbAddTeam(p) {
 async function dbAddTeamsBulk(rows) {
   if (supabaseClient) {
     const records = rows.map(r => ({
-      id: 't_' + Date.now() + '_' + Math.floor(Math.random() * 10000) + '_' + Math.floor(Math.random()*100),
+      id: r.id || ('t_' + Date.now() + '_' + Math.floor(Math.random() * 10000) + '_' + Math.floor(Math.random()*100)),
+      team_id: r.teamId || '',
       name: r.name,
+      contact: r.contact || '',
       past: Number(r.past)||0, present: Number(r.present)||0, future: Number(r.future)||0
     }));
     // Instant Supabase bulk write (<50ms)
@@ -342,7 +349,10 @@ function enrichTeams(teams, matches){
       };
     });
     return {
-      id: t.id, name: t.name,
+      id: t.id,
+      teamId: t.teamId || t.team_id || '',
+      name: t.name,
+      contact: t.contact || '',
       coins: { past: Number(t.past), present: Number(t.present), future: Number(t.future) },
       playedStalls, opponentCounts, opponentMatchDetails, matchLog
     };
@@ -377,7 +387,7 @@ async function loadAll(){
       }));
 
       const rawTeams = (tRes.data || []).map(t => ({
-        id: t.id, name: t.name, past: Number(t.past), present: Number(t.present), future: Number(t.future)
+        id: t.id, teamId: t.team_id || t.teamId || '', name: t.name, contact: t.contact || '', past: Number(t.past), present: Number(t.present), future: Number(t.future)
       }));
 
       const teams = enrichTeams(rawTeams, rawMatches);
@@ -390,7 +400,10 @@ async function loadAll(){
         ...m, time: Number(m.time), wager: Number(m.wager),
         changeA: Number(m.changeA), changeB: Number(m.changeB)
       }));
-      const teams = enrichTeams(data.teams||[], matches);
+      const rawTeams = (data.teams||[]).map(t=>({
+        id: t.id, teamId: t.teamId || t.team_id || '', name: t.name, contact: t.contact || '', past: Number(t.past), present: Number(t.present), future: Number(t.future)
+      }));
+      const teams = enrichTeams(rawTeams, matches);
       return { teams, stalls, matches };
     }
   } catch(e){
@@ -553,7 +566,11 @@ async function renderSetup(main){
       <div class="sub">Starting coins default to ${DEFAULT_START.past} Past / ${DEFAULT_START.present} Present / ${DEFAULT_START.future} Future per the rules — adjust if needed.</div>
 
       <!-- Manual entry -->
-      <div class="row"><div><label>Team name</label><input id="teamName" placeholder="e.g. Team Falcon"></div></div>
+      <div class="row">
+        <div><label>Team ID (optional)</label><input id="teamIdInput" placeholder="e.g. T01"></div>
+        <div><label>Team name</label><input id="teamName" placeholder="e.g. Team Falcon"></div>
+        <div><label>Contact Info (optional)</label><input id="teamContact" placeholder="e.g. +1 555-0199 or email"></div>
+      </div>
       <div class="row">
         <div><label>Past</label><input id="startPast" type="number" value="${DEFAULT_START.past}" min="0"></div>
         <div><label>Present</label><input id="startPresent" type="number" value="${DEFAULT_START.present}" min="0"></div>
@@ -568,11 +585,12 @@ async function renderSetup(main){
       <h2 style="font-size:0.95rem; margin-bottom:4px;">📥 Import Participants from Excel</h2>
       <div class="sub">
         Upload an <code>.xlsx</code> / <code>.xls</code> file. The app reads these columns from the first sheet:
+        <strong>«${IMPORT_FIELDS.teamId}»</strong> (optional),
         <strong>«${IMPORT_FIELDS.name}»</strong> (required),
+        <strong>«${IMPORT_FIELDS.contact}»</strong> (optional),
         <strong>«${IMPORT_FIELDS.past}»</strong>,
         <strong>«${IMPORT_FIELDS.present}»</strong>,
         <strong>«${IMPORT_FIELDS.future}»</strong> (optional, defaults to ${DEFAULT_START.past}/${DEFAULT_START.present}/${DEFAULT_START.future}).
-        Column names are set by <code>IMPORT_FIELDS</code> in the script and can be changed by a developer.
       </div>
       <label>Excel file</label>
       <input type="file" id="importFile" accept=".xlsx,.xls,.csv">
@@ -585,12 +603,17 @@ async function renderSetup(main){
 
       <hr class="divider">
 
-      <table><thead><tr><th>Team</th><th>Coins (P/Pr/F)</th><th></th></tr></thead>
+      <table><thead><tr><th>Team ID</th><th>Team Name</th><th>Contact</th><th>Coins (P/Pr/F)</th><th></th></tr></thead>
       <tbody>
       ${teams.length? teams.map(t=>`
-        <tr><td>${t.name}</td><td>${t.coins.past} / ${t.coins.present} / ${t.coins.future}</td>
-        <td><button class="btn danger small" data-del-team="${t.id}">Remove</button></td></tr>
-      `).join('') : '<tr><td colspan="3" class="empty">No teams yet.</td></tr>'}
+        <tr>
+          <td><code>${t.teamId || t.id}</code></td>
+          <td><strong>${t.name}</strong></td>
+          <td>${t.contact || '<span class="muted">—</span>'}</td>
+          <td>${t.coins.past} / ${t.coins.present} / ${t.coins.future}</td>
+          <td><button class="btn danger small" data-del-team="${t.id}">Remove</button></td>
+        </tr>
+      `).join('') : '<tr><td colspan="5" class="empty">No teams yet.</td></tr>'}
       </tbody></table>
     </div>
 
@@ -649,13 +672,17 @@ async function renderSetup(main){
   // ---- Add Team (manual) ----
   document.getElementById('addTeamBtn').onclick = async ()=>{
     const name = document.getElementById('teamName').value.trim();
+    const teamId = document.getElementById('teamIdInput').value.trim();
+    const contact = document.getElementById('teamContact').value.trim();
     const msg = document.getElementById('setupMsg');
     if(!name){ msg.innerHTML = '<div class="msg err">Enter a team name.</div>'; return; }
     const fresh = await loadAll();
     if(fresh.teams.some(t=>t.name.toLowerCase()===name.toLowerCase())){ msg.innerHTML = '<div class="msg err">A team with that name already exists.</div>'; return; }
     try {
       await dbAddTeam({
+        teamId,
         name,
+        contact,
         past: Number(document.getElementById('startPast').value)||0,
         present: Number(document.getElementById('startPresent').value)||0,
         future: Number(document.getElementById('startFuture').value)||0
@@ -687,13 +714,15 @@ async function renderSetup(main){
         const existingNames = new Set(teams.map(t=>t.name.toLowerCase()));
 
         const parsed = raw.map(row=>{
-          const name = String(row[IMPORT_FIELDS.name]||'').trim();
+          const name    = String(row[IMPORT_FIELDS.name]||'').trim();
+          const teamId  = String(row[IMPORT_FIELDS.teamId]||row['Team ID']||row['ID']||'').trim();
+          const contact = String(row[IMPORT_FIELDS.contact]||row['Contact']||row['Phone']||'').trim();
           const past    = Number(row[IMPORT_FIELDS.past])    || DEFAULT_START.past;
           const present = Number(row[IMPORT_FIELDS.present]) || DEFAULT_START.present;
           const future  = Number(row[IMPORT_FIELDS.future])  || DEFAULT_START.future;
           const skip = !name || existingNames.has(name.toLowerCase());
-          if(!skip) importRows.push({ name, past, present, future });
-          return { name: name||'(blank)', past, present, future, skip };
+          if(!skip) importRows.push({ teamId, name, contact, past, present, future });
+          return { teamId, name, contact, past, present, future, skip };
         });
 
         if(!parsed.length){
@@ -705,11 +734,14 @@ async function renderSetup(main){
         previewArea.innerHTML = `
           <div class="import-preview">
             <table>
-              <thead><tr><th>Name</th><th>Past</th><th>Present</th><th>Future</th><th>Status</th></tr></thead>
+              <thead><tr><th>Team ID</th><th>Name</th><th>Contact</th><th>Past</th><th>Present</th><th>Future</th><th>Status</th></tr></thead>
               <tbody>
               ${parsed.map(r=>`
                 <tr class="${r.skip?'import-row-skip':'import-row-ok'}">
-                  <td>${r.name}</td><td>${r.past}</td><td>${r.present}</td><td>${r.future}</td>
+                  <td>${r.teamId || '<span class="muted">—</span>'}</td>
+                  <td>${r.name}</td>
+                  <td>${r.contact || '<span class="muted">—</span>'}</td>
+                  <td>${r.past}</td><td>${r.present}</td><td>${r.future}</td>
                   <td>${r.skip ? '<span class="muted">Skip (exists / blank)</span>' : '<span style="color:var(--win)">✓ Import</span>'}</td>
                 </tr>`).join('')}
               </tbody>
@@ -791,7 +823,9 @@ async function renderSetup(main){
       const wb = XLSX.utils.book_new();
 
       const participantRows = t2.map(t=>({
+        [IMPORT_FIELDS.teamId]:  t.teamId || t.id,
         [IMPORT_FIELDS.name]:    t.name,
+        [IMPORT_FIELDS.contact]: t.contact || '',
         [IMPORT_FIELDS.past]:    t.coins.past,
         [IMPORT_FIELDS.present]: t.coins.present,
         [IMPORT_FIELDS.future]:  t.coins.future,
@@ -802,7 +836,7 @@ async function renderSetup(main){
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(participantRows), 'Participants');
 
       const teamRows = t2.map(t=>({
-        ID: t.id, Name: t.name, Past: t.coins.past, Present: t.coins.present, Future: t.coins.future,
+        'Team ID': t.teamId || t.id, Name: t.name, Contact: t.contact || '', Past: t.coins.past, Present: t.coins.present, Future: t.coins.future,
         'Coin Value (Past-eq)': Number(coinValue(t).toFixed(2)),
         Wins: wins(t), 'Stalls Played': t.playedStalls.length
       }));
@@ -861,8 +895,8 @@ async function renderConductor(main){
         ${stalls.map(s=>`<option value="${s.id}">${s.name} (${s.category}, min ${s.minWager})</option>`).join('')}
       </select>
       <div class="row">
-        <div><label>Team A</label><select id="teamASel"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div>
-        <div><label>Team B</label><select id="teamBSel"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div>
+        <div><label>Team A</label><select id="teamASel"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.teamId ? `[${t.teamId}] ` : ''}${t.name}</option>`).join('')}</select></div>
+        <div><label>Team B</label><select id="teamBSel"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.teamId ? `[${t.teamId}] ` : ''}${t.name}</option>`).join('')}</select></div>
       </div>
       <label>Conductor initials</label>
       <input id="conductorInit" placeholder="e.g. RS">
@@ -882,8 +916,8 @@ async function renderConductor(main){
       <h2>🔍 Head-to-Head Discrepancy Check</h2>
       <div class="sub">Check how many times any two teams have competed, and which stalls/games they played. A warning is shown when teams reach the ${MAX_ENCOUNTERS}-encounter limit.</div>
       <div class="row">
-        <div><label>Team A</label><select id="dcA"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div>
-        <div><label>Team B</label><select id="dcB"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div>
+        <div><label>Team A</label><select id="dcA"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.teamId ? `[${t.teamId}] ` : ''}${t.name}</option>`).join('')}</select></div>
+        <div><label>Team B</label><select id="dcB"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.teamId ? `[${t.teamId}] ` : ''}${t.name}</option>`).join('')}</select></div>
       </div>
       <div id="dcResult"></div>
     </div>
@@ -1036,7 +1070,7 @@ async function renderExchange(main){
       <h2>Exchange Centre</h2>
       <div class="sub">Fixed ratio: 3 Past = 2 Present = 1 Future. Exchanges must convert to a whole number of coins.</div>
       <label>Team</label>
-      <select id="exTeam"><option value="">— Select team —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select>
+      <select id="exTeam"><option value="">— Select team —</option>${teams.map(t=>`<option value="${t.id}">${t.teamId ? `[${t.teamId}] ` : ''}${t.name}</option>`).join('')}</select>
       <div id="exBalance"></div>
       <div class="row">
         <div><label>From</label><select id="exFrom"><option value="past">Past</option><option value="present">Present</option><option value="future">Future</option></select></div>
@@ -1119,7 +1153,7 @@ async function renderTeamView(main){
     <div class="card">
       <h2>Team View</h2>
       <div class="sub">Select a team to see their coins, stalls played, and match history.</div>
-      <select id="tvSel"><option value="">— Select team —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select>
+      <select id="tvSel"><option value="">— Select team —</option>${teams.map(t=>`<option value="${t.id}">${t.teamId ? `[${t.teamId}] ` : ''}${t.name}</option>`).join('')}</select>
       <div id="tvBody"></div>
     </div>
   `;
@@ -1146,6 +1180,10 @@ async function renderTeamView(main){
     }).join('');
 
     body.innerHTML = `
+      <div class="muted" style="margin-bottom:8px;">
+        ${t.teamId ? `<span class="tag" style="margin-left:0; font-size:0.8rem;">Team ID: <b>${t.teamId}</b></span>` : ''}
+        ${t.contact ? `<span class="tag" style="font-size:0.8rem;">Contact: <b>${t.contact}</b></span>` : ''}
+      </div>
       <div class="coin-badges">
         <span class="badge past">Past: ${t.coins.past}</span>
         <span class="badge present">Present: ${t.coins.present}</span>
