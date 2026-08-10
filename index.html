@@ -182,15 +182,14 @@ async function apiPost(action, payload={}){
 }
 
 // Fire-and-forget background sync to Google Sheet (Excel) — 0ms delay for app priority
-function bgSyncSheet(action, payload) {
+function bgSyncSheet() {
   if (API_URL && API_URL.startsWith('http') && !API_URL.includes('PASTE_YOUR')) {
-    apiPost(action, payload).catch(err => console.warn('Background Excel sync warning:', err));
+    apiPost('syncFromSupabase', {}).catch(err => console.warn('Background Excel sync warning:', err));
   }
 }
 
 // ---------- UNIFIED DB MUTATIONS ----------
 async function dbAddTeam(p) {
-  bgSyncSheet('addTeam', p);
   if (supabaseClient) {
     const id = p.id || ('t_' + Date.now() + '_' + Math.floor(Math.random() * 1000));
     const { error } = await supabaseClient.from('teams').insert([{
@@ -201,6 +200,7 @@ async function dbAddTeam(p) {
       past: Number(p.past)||0, present: Number(p.present)||0, future: Number(p.future)||0
     }]);
     if (error) throw new Error(error.message);
+    bgSyncSheet();
     return { ok: true, id };
   } else {
     return apiPost('addTeam', p);
@@ -219,15 +219,7 @@ async function dbAddTeamsBulk(rows) {
     // Instant Supabase bulk write (<50ms)
     const { error } = await supabaseClient.from('teams').insert(records);
     if (error) throw new Error(error.message);
-
-    // Background asynchronous queue to update Excel without freezing UI
-    (async () => {
-      for (const row of rows) {
-        bgSyncSheet('addTeam', row);
-        await new Promise(r => setTimeout(r, 120));
-      }
-    })();
-
+    bgSyncSheet();
     return { ok: true, count: records.length };
   } else {
     let done = 0;
@@ -240,10 +232,10 @@ async function dbAddTeamsBulk(rows) {
 }
 
 async function dbDeleteTeam(id) {
-  bgSyncSheet('deleteTeam', { id });
   if (supabaseClient) {
     const { error } = await supabaseClient.from('teams').delete().eq('id', id);
     if (error) throw new Error(error.message);
+    bgSyncSheet();
     return { ok: true };
   } else {
     return apiPost('deleteTeam', { id });
@@ -251,13 +243,13 @@ async function dbDeleteTeam(id) {
 }
 
 async function dbAddStall(p) {
-  bgSyncSheet('addStall', p);
   if (supabaseClient) {
     const id = 's_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
     const { error } = await supabaseClient.from('stalls').insert([{
       id, name: p.name, category: p.category, min_wager: Number(p.minWager)||1
     }]);
     if (error) throw new Error(error.message);
+    bgSyncSheet();
     return { ok: true, id };
   } else {
     return apiPost('addStall', p);
@@ -265,10 +257,10 @@ async function dbAddStall(p) {
 }
 
 async function dbDeleteStall(id) {
-  bgSyncSheet('deleteStall', { id });
   if (supabaseClient) {
     const { error } = await supabaseClient.from('stalls').delete().eq('id', id);
     if (error) throw new Error(error.message);
+    bgSyncSheet();
     return { ok: true };
   } else {
     return apiPost('deleteStall', { id });
@@ -276,12 +268,12 @@ async function dbDeleteStall(id) {
 }
 
 async function dbUpdateTeamCoins(p) {
-  bgSyncSheet('updateTeamCoins', p);
   if (supabaseClient) {
     const { error } = await supabaseClient.from('teams').update({
       past: Number(p.past), present: Number(p.present), future: Number(p.future)
     }).eq('id', p.id);
     if (error) throw new Error(error.message);
+    bgSyncSheet();
     return { ok: true };
   } else {
     return apiPost('updateTeamCoins', p);
@@ -289,7 +281,6 @@ async function dbUpdateTeamCoins(p) {
 }
 
 async function dbAppendMatch(p) {
-  bgSyncSheet('appendMatch', p);
   if (supabaseClient) {
     const { error } = await supabaseClient.from('matches').insert([{
       time: Number(p.time),
@@ -302,6 +293,7 @@ async function dbAppendMatch(p) {
       conductor: p.conductor || ''
     }]);
     if (error) throw new Error(error.message);
+    bgSyncSheet();
     return { ok: true };
   } else {
     return apiPost('appendMatch', p);
@@ -309,13 +301,13 @@ async function dbAppendMatch(p) {
 }
 
 async function dbResetAll() {
-  bgSyncSheet('resetAll', {});
   if (supabaseClient) {
     await Promise.all([
       supabaseClient.from('matches').delete().neq('id', -1),
       supabaseClient.from('teams').delete().neq('id', '__none__'),
       supabaseClient.from('stalls').delete().neq('id', '__none__')
     ]);
+    bgSyncSheet();
     return { ok: true };
   } else {
     return apiPost('resetAll', {});
@@ -636,11 +628,15 @@ async function renderSetup(main){
       </tbody></table>
     </div>
 
-    <!-- ========= EXPORT ========= -->
+    <!-- ========= EXPORT & GOOGLE SHEET SYNC ========= -->
     <div class="card">
-      <h2>Backup / Export</h2>
-      <div class="sub">Every action writes straight to your connected database — that's your live backup. This button gives you a point-in-time <code>.xlsx</code> snapshot with all participants, stalls, matches, and leaderboard.</div>
-      <button class="btn secondary" id="exportBtn">⬇ Download Excel Backup</button>
+      <h2>Backup & Google Sheet Sync</h2>
+      <div class="sub">Every action writes straight to your connected database — that's your live backup. You can also sync live to your Google Sheet or download a point-in-time <code>.xlsx</code> file.</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <button class="btn" id="syncSheetBtn">⚡ Sync Live Database to Google Sheet Now</button>
+        <button class="btn secondary" id="exportBtn">⬇ Download Offline Excel Backup</button>
+      </div>
+      <div id="syncSheetMsg"></div>
       <div id="exportMsg"></div>
     </div>
 
@@ -813,6 +809,25 @@ async function renderSetup(main){
       }
     };
   });
+
+  // ---- Google Sheet Live Sync ----
+  document.getElementById('syncSheetBtn').onclick = async ()=>{
+    const btn = document.getElementById('syncSheetBtn');
+    const msg = document.getElementById('syncSheetMsg');
+    btn.disabled = true;
+    btn.textContent = 'Syncing…';
+    msg.innerHTML = '<div class="msg ok">Syncing Supabase DB to Google Sheet…</div>';
+    try {
+      const res = await apiPost('syncFromSupabase', {});
+      if (res.error) throw new Error(res.error);
+      msg.innerHTML = `<div class="msg ok">✓ Google Sheet Synced! (${res.synced ? res.synced.teams : 'All'} teams, ${res.synced ? res.synced.stalls : 'all'} stalls, ${res.synced ? res.synced.matches : 'all'} matches updated).</div>`;
+    } catch(e) {
+      msg.innerHTML = `<div class="msg err">Sync failed: ${e.message}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⚡ Sync Live Database to Google Sheet Now';
+    }
+  };
 
   // ---- Export ----
   document.getElementById('exportBtn').onclick = async ()=>{

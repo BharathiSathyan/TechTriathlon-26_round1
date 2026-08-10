@@ -1,23 +1,47 @@
 /**
- * ROUND 1 COIN TRACKER — Google Apps Script backend.
+ * ROUND 1 COIN TRACKER — Google Apps Script Backend & Supabase Live Sync.
+ *
+ * SPREADSHEET URL:
+ * https://docs.google.com/spreadsheets/d/1a0kTN3_oNyXXU3jfnuT5Cy1v6kVJT32li31HeACjMc4/edit
  *
  * SETUP:
- * 1. Create a new blank Google Sheet.
+ * 1. Open your Google Sheet.
  * 2. Extensions > Apps Script.
- * 3. Delete any starter code, paste this whole file in, and save (Ctrl/Cmd+S).
+ * 3. Delete any code, paste this entire file in, and save (Ctrl/Cmd+S).
  * 4. Click Deploy > New deployment.
- *    - Type: "Web app"
+ *    - Select type: "Web app"
  *    - Execute as: Me
  *    - Who has access: Anyone
- * 5. Click Deploy, authorize the permissions it asks for, then copy the
- *    "Web app URL" it gives you (looks like https://script.google.com/macros/s/XXXX/exec).
- * 6. Paste that URL into API_URL near the top of coin-tracker.html.
+ * 5. Click Deploy / Manage Deployments > Edit > New Version > Deploy.
  *
- * The three tabs (Teams, Stalls, Matches) are created automatically the first
- * time the app calls this script — you don't need to make them by hand.
+ * AUTOMATIC 1-MINUTE TIME TRIGGER (Optional for hands-free auto-sync):
+ * Run the function `setupAutoSyncTrigger()` once in Apps Script to automatically
+ * pull from Supabase every minute!
  */
 
+const SUPABASE_URL = 'https://rpqcvqnqpyuvtwqllxzu.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJwcWN2cW5xcHl1dnR3cWxseHp1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzNjg2NTIsImV4cCI6MjEwMTk0NDY1Mn0.5wEssEKtM6sQtguw3yKGpwinjbLeg0pZHyanovGbd1w';
+
 const SHEET_NAMES = { teams: 'Teams', stalls: 'Stalls', matches: 'Matches' };
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('⚡ Supabase Sync')
+    .addItem('Sync Now from Supabase DB', 'syncFromSupabase')
+    .addItem('Setup 1-Minute Auto Sync', 'setupAutoSyncTrigger')
+    .addToUi();
+}
+
+function setupAutoSyncTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === 'syncFromSupabase') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('syncFromSupabase')
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+}
 
 function doGet(e) {
   return handle(e);
@@ -29,14 +53,17 @@ function doPost(e) {
 function handle(e) {
   try {
     let params;
-    if (e.postData && e.postData.contents) {
+    if (e && e.postData && e.postData.contents) {
       params = JSON.parse(e.postData.contents);
-    } else {
+    } else if (e && e.parameter) {
       params = e.parameter;
+    } else {
+      params = {};
     }
     const action = params.action;
     let result;
     switch (action) {
+      case 'syncFromSupabase': result = syncFromSupabase(); break;
       case 'getAll': result = getAll(); break;
       case 'addTeam': result = addTeam(params); break;
       case 'deleteTeam': result = deleteTeam(params.id); break;
@@ -45,7 +72,9 @@ function handle(e) {
       case 'updateTeamCoins': result = updateTeamCoins(params); break;
       case 'appendMatch': result = appendMatch(params); break;
       case 'resetAll': result = resetAll(); break;
-      default: result = { error: 'Unknown action: ' + action };
+      default:
+        // Default action when called without params is sync from Supabase!
+        result = syncFromSupabase();
     }
     return jsonOut(result);
   } catch (err) {
@@ -78,8 +107,99 @@ function matchesSheet() {
   ]);
 }
 
+/**
+ * PULLS ENTIRE DATABASE FROM SUPABASE REST API AND REFRESHES ALL GOOGLE SHEET TABS
+ */
+function syncFromSupabase() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const options = {
+      method: 'get',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_ANON_KEY
+      },
+      muteHttpExceptions: true
+    };
+
+    const teamsRes = UrlFetchApp.fetch(SUPABASE_URL + '/rest/v1/teams?select=*', options);
+    const stallsRes = UrlFetchApp.fetch(SUPABASE_URL + '/rest/v1/stalls?select=*', options);
+    const matchesRes = UrlFetchApp.fetch(SUPABASE_URL + '/rest/v1/matches?select=*&order=time.asc', options);
+
+    const teams = JSON.parse(teamsRes.getContentText()) || [];
+    const stalls = JSON.parse(stallsRes.getContentText()) || [];
+    const matches = JSON.parse(matchesRes.getContentText()) || [];
+
+    // 1. Overwrite Teams Sheet
+    const tSheet = teamsSheet();
+    tSheet.clearContents();
+    tSheet.appendRow(['id', 'name', 'past', 'present', 'future', 'teamId', 'contact']);
+    if (teams && teams.length > 0) {
+      const rows = teams.map(t => [
+        t.id || '',
+        t.name || '',
+        Number(t.past) || 0,
+        Number(t.present) || 0,
+        Number(t.future) || 0,
+        t.team_id || t.teamId || '',
+        t.contact || ''
+      ]);
+      tSheet.getRange(2, 1, rows.length, 7).setValues(rows);
+    }
+
+    // 2. Overwrite Stalls Sheet
+    const sSheet = stallsSheet();
+    sSheet.clearContents();
+    sSheet.appendRow(['id', 'name', 'category', 'minWager']);
+    if (stalls && stalls.length > 0) {
+      const rows = stalls.map(s => [
+        s.id || '',
+        s.name || '',
+        s.category || '',
+        Number(s.min_wager !== undefined ? s.min_wager : (s.minWager || 1))
+      ]);
+      sSheet.getRange(2, 1, rows.length, 4).setValues(rows);
+    }
+
+    // 3. Overwrite Matches Sheet
+    const mSheet = matchesSheet();
+    mSheet.clearContents();
+    mSheet.appendRow([
+      'time', 'stallId', 'stallName', 'teamAId', 'teamAName', 'teamBId', 'teamBName',
+      'wager', 'coinType', 'resultA', 'resultB', 'changeA', 'changeB', 'conductor'
+    ]);
+    if (matches && matches.length > 0) {
+      const rows = matches.map(m => [
+        Number(m.time) || 0,
+        m.stall_id || m.stallId || '',
+        m.stall_name || m.stallName || '',
+        m.team_a_id || m.teamAId || '',
+        m.team_a_name || m.teamAName || '',
+        m.team_b_id || m.teamBId || '',
+        m.team_b_name || m.teamBName || '',
+        Number(m.wager) || 0,
+        m.coin_type || m.coinType || '',
+        m.result_a || m.resultA || '',
+        m.result_b || m.resultB || '',
+        Number(m.change_a !== undefined ? m.change_a : m.changeA) || 0,
+        Number(m.change_b !== undefined ? m.change_b : m.changeB) || 0,
+        m.conductor || ''
+      ]);
+      mSheet.getRange(2, 1, rows.length, 14).setValues(rows);
+    }
+
+    return { ok: true, synced: { teams: teams.length, stalls: stalls.length, matches: matches.length } };
+  } catch (err) {
+    return { error: err.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function rowsToObjects(sheet) {
   const data = sheet.getDataRange().getValues();
+  if (!data || !data.length) return [];
   const headers = data.shift();
   return data
     .filter(r => r[0] !== '' && r[0] !== null)
