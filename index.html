@@ -427,6 +427,31 @@ function coinValue(team){
 }
 function wins(team){ return team.matchLog.filter(m=>m.result==='Win').length; }
 
+// Strict Leaderboard Ranking Comparator:
+// 1. Primary: Coin Value (Past-equivalent)
+// 2. 1st Tie-Breaker: Most Wins
+// 3. 2nd Tie-Breaker: Most Games/Matches Played
+// 4. 3rd Tie-Breaker: Most Stalls Visited
+function compareTeams(a, b) {
+  const valA = coinValue(a);
+  const valB = coinValue(b);
+  if (valB !== valA) return valB - valA;
+
+  const winsA = wins(a);
+  const winsB = wins(b);
+  if (winsB !== winsA) return winsB - winsA;
+
+  const gamesA = (a.matchLog ? a.matchLog.length : 0);
+  const gamesB = (b.matchLog ? b.matchLog.length : 0);
+  if (gamesB !== gamesA) return gamesB - gamesA;
+
+  const stallsA = (a.playedStalls ? a.playedStalls.length : 0);
+  const stallsB = (b.playedStalls ? b.playedStalls.length : 0);
+  if (stallsB !== stallsA) return stallsB - stallsA;
+
+  return a.name.localeCompare(b.name);
+}
+
 // ---------- H2H DISCREPANCY HELPERS ----------
 function buildH2HHtml(teamA, teamB){
   const count = (teamA.opponentCounts[teamB.id] || 0);
@@ -867,10 +892,16 @@ async function renderSetup(main){
       }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(matchRows), 'Match Log');
 
-      const ranked = [...t2].sort((a,b)=> coinValue(b)-coinValue(a) || wins(b)-wins(a) || b.playedStalls.length-a.playedStalls.length);
+      const ranked = [...t2].sort(compareTeams);
       const lbRows = ranked.map((t,i)=>({
-        Rank: i+1, Team: t.name, 'Coin Value': Number(coinValue(t).toFixed(2)),
-        Wins: wins(t), Stalls: t.playedStalls.length, Qualified: i<15 ? 'Yes' : 'No'
+        Rank: i+1,
+        'Team ID': t.teamId || t.id,
+        Team: t.name,
+        'Coin Value (Past-eq)': Number(coinValue(t).toFixed(2)),
+        Wins: wins(t),
+        'Games Played': t.matchLog ? t.matchLog.length : 0,
+        'Stalls Visited': t.playedStalls.length,
+        Qualified: i < 15 ? 'Yes' : 'No'
       }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(lbRows), 'Leaderboard');
 
@@ -1233,23 +1264,108 @@ async function renderLeaderboard(main){
   const { teams, stalls, error } = await loadAll();
   if(error){ main.innerHTML = `<div class="card"><div class="msg err">Couldn't reach the database: ${error}</div></div>`; return; }
 
-  const ranked = teams.map(t=>({
-    name: t.name, value: coinValue(t), wins: wins(t), stallsCompleted: t.playedStalls.length
-  })).sort((a,b)=> b.value-a.value || b.wins-a.wins || b.stallsCompleted-a.stallsCompleted);
-
   main.innerHTML = `
     <div class="card">
       <h2>Leaderboard</h2>
-      <div class="sub">Ranked by total coin value (Past-equivalent), then wins, then stalls completed. Top 15 qualify for Round 2.</div>
-      <table><thead><tr><th>Rank</th><th>Team</th><th>Coin Value (Past-eq)</th><th>Wins</th><th>Stalls</th></tr></thead>
-      <tbody>
-      ${ranked.length ? ranked.map((r,i)=>`
-        <tr class="${i<15?'qualified':''}"><td>${i+1}${i<15?' ✓':''}</td><td>${r.name}</td>
-        <td>${r.value % 1 === 0 ? r.value : r.value.toFixed(1)}</td><td>${r.wins}</td><td>${r.stallsCompleted}/${stalls.length}</td></tr>
-      `).join('') : '<tr><td colspan="5" class="empty">No teams yet.</td></tr>'}
-      </tbody></table>
+      <div class="sub">
+        Ranked by <strong>Total Coin Value (Past-eq)</strong>.<br>
+        Tie-breaker 1: <strong>Most Wins</strong> · Tie-breaker 2: <strong>Most Games Played</strong>.<br>
+        Top 15 qualify for Round 2.
+      </div>
+
+      <!-- Filter Controls -->
+      <div class="row" style="margin-top:14px; margin-bottom:14px; align-items:flex-end;">
+        <div style="flex:1; min-width:200px;">
+          <label>Filter by Min Stalls Visited</label>
+          <select id="lbMinStallsSel">
+            <option value="0">Show All Teams (0+ stalls)</option>
+            <option value="1">At least 1 stall visited</option>
+            <option value="2">At least 2 stalls visited</option>
+            <option value="3">At least 3 stalls visited</option>
+            <option value="5">At least 5 stalls visited</option>
+            <option value="10">At least 10 stalls visited</option>
+            <option value="15">At least 15 stalls visited</option>
+            <option value="${stalls.length}">All ${stalls.length} stalls visited</option>
+          </select>
+        </div>
+        <div style="flex:1; min-width:160px;">
+          <label>Custom Min Stalls</label>
+          <input id="lbMinStallsInput" type="number" min="0" max="${stalls.length}" value="0" placeholder="e.g. 3">
+        </div>
+      </div>
+
+      <div id="lbFilterSummary" class="muted" style="font-size:0.85rem; margin-bottom:12px; font-weight:600;"></div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Team ID</th>
+            <th>Team Name</th>
+            <th>Coin Value (Past-eq)</th>
+            <th>Wins</th>
+            <th>Games Played</th>
+            <th>Stalls Visited</th>
+          </tr>
+        </thead>
+        <tbody id="lbTableBody"></tbody>
+      </table>
     </div>
   `;
+
+  const sel = document.getElementById('lbMinStallsSel');
+  const input = document.getElementById('lbMinStallsInput');
+  const tbody = document.getElementById('lbTableBody');
+  const summary = document.getElementById('lbFilterSummary');
+
+  function updateTable() {
+    const minStalls = Math.max(0, Number(input.value) || 0);
+
+    // Filter teams meeting minStalls requirement
+    const filtered = teams.filter(t => t.playedStalls.length >= minStalls);
+
+    // Sort using strict tie-breaking priority order:
+    // 1. Coin Value (Past-eq) -> 2. Most Wins -> 3. Most Games Played -> 4. Most Stalls Visited -> 5. Name
+    filtered.sort(compareTeams);
+
+    summary.innerHTML = `Showing <b>${filtered.length}</b> of <b>${teams.length}</b> team(s) with at least <b>${minStalls}</b> stall(s) visited.`;
+
+    if (!filtered.length) {
+      tbody.innerHTML = `<tr><td colspan="7" class="empty">No teams match the minimum ${minStalls} stalls visited filter.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtered.map((t, i) => {
+      const val = coinValue(t);
+      const valStr = val % 1 === 0 ? val.toString() : val.toFixed(1);
+      const isQualified = i < 15;
+      const gameCount = t.matchLog ? t.matchLog.length : 0;
+
+      return `
+        <tr class="${isQualified ? 'qualified' : ''}">
+          <td><b>#${i + 1}</b> ${isQualified ? '✓' : ''}</td>
+          <td><code>${t.teamId || t.id}</code></td>
+          <td><strong>${t.name}</strong></td>
+          <td><b>${valStr}</b></td>
+          <td>${wins(t)}</td>
+          <td>${gameCount}</td>
+          <td>${t.playedStalls.length} / ${stalls.length}</td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  sel.onchange = () => {
+    input.value = sel.value;
+    updateTable();
+  };
+
+  input.oninput = () => {
+    sel.value = input.value;
+    updateTable();
+  };
+
+  updateTable();
 }
 
 renderNav();
