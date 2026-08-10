@@ -28,6 +28,7 @@
   .card .sub{ color:var(--muted); font-size:0.8rem; margin-bottom:14px; }
   label{ display:block; font-size:0.78rem; color:var(--muted); margin:10px 0 4px; font-weight:600; }
   input, select{ width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--line); background:#0f1018; color:var(--text); font-size:0.9rem; }
+  input[type="file"]{ padding:8px 10px; cursor:pointer; }
   input:focus, select:focus{ outline:2px solid var(--future); }
   .row{ display:flex; gap:12px; flex-wrap:wrap; }
   .row > div{ flex:1; min-width:150px; }
@@ -59,6 +60,25 @@
   .muted{ color:var(--muted); }
   .tag{ font-size:0.72rem; padding:2px 8px; border-radius:10px; background:var(--panel2); color:var(--muted); margin-left:6px;}
   code{ background:#0f1018; padding:2px 6px; border-radius:4px; font-size:0.85em; }
+
+  /* ---- Discrepancy checker styles ---- */
+  .h2h-bar{ display:flex; align-items:center; gap:10px; margin:12px 0 6px; }
+  .h2h-count{ font-size:1.6rem; font-weight:800; min-width:36px; text-align:center; }
+  .h2h-count.ok-count{ color:var(--win); }
+  .h2h-count.warn-count{ color:var(--past); }
+  .h2h-count.err-count{ color:var(--loss); }
+  .h2h-label{ font-size:0.82rem; color:var(--muted); line-height:1.4; }
+  .progress-track{ flex:1; height:8px; background:#0f1018; border-radius:8px; overflow:hidden; }
+  .progress-fill{ height:100%; border-radius:8px; transition:width .4s ease, background .4s; }
+
+  /* ---- Import preview table ---- */
+  .import-preview{ max-height:240px; overflow-y:auto; margin:10px 0; border:1px solid var(--line); border-radius:8px; }
+  .import-preview table{ margin-top:0; }
+  .import-row-ok td:first-child{ color:var(--win); }
+  .import-row-skip td:first-child{ color:var(--muted); text-decoration:line-through; }
+
+  /* ---- Section divider ---- */
+  .divider{ border:none; border-top:1px solid var(--line); margin:18px 0; }
 </style>
 </head>
 <body>
@@ -90,6 +110,21 @@ const RATE = {
   'past-present': 2/3, 'present-past': 3/2
 };
 const DEFAULT_START = { past: 9, present: 6, future: 4 };
+
+// ---- DISCREPANCY RULE — how many times two teams may face each other ----
+// Change MAX_ENCOUNTERS to adjust the cap (default: 3).
+const MAX_ENCOUNTERS = 3;
+
+// ---- IMPORT FIELD MAP — change these to match your Excel column headers ----
+// These are the column headers the app looks for when importing participants from Excel.
+// A developer can rename any value here to match a different spreadsheet layout.
+const IMPORT_FIELDS = {
+  name:    'Name',     // REQUIRED: column header for team / participant name
+  past:    'Past',     // optional: starting Past coins   (defaults to DEFAULT_START.past)
+  present: 'Present',  // optional: starting Present coins (defaults to DEFAULT_START.present)
+  future:  'Future'    // optional: starting Future coins  (defaults to DEFAULT_START.future)
+};
+
 const TABS = ['setup','conductor','exchange','team','leaderboard'];
 const TAB_LABELS = { setup:'Admin Setup', conductor:'Stall Conductor', exchange:'Exchange Centre', team:'Team View', leaderboard:'Leaderboard' };
 let isAdminUnlocked = false;
@@ -106,7 +141,7 @@ async function apiGet(action, params={}){
 async function apiPost(action, payload={}){
   const res = await fetch(API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight, which Apps Script can't handle reliably
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight
     body: JSON.stringify({ action, ...payload })
   });
   return res.json();
@@ -116,12 +151,21 @@ function enrichTeams(teams, matches){
   return teams.map(t=>{
     const own = matches.filter(m=> m.teamAId===t.id || m.teamBId===t.id);
     const playedStalls = [...new Set(own.map(m=>m.stallId))];
+    // opponentCounts: { oppId: count }
     const opponentCounts = {};
+    // opponentMatchDetails: { oppId: [{stallName, time, resultForT}] }
+    const opponentMatchDetails = {};
     const matchLog = own.map(m=>{
       const isA = m.teamAId===t.id;
       const oppId = isA ? m.teamBId : m.teamAId;
       const oppName = isA ? m.teamBName : m.teamAName;
       opponentCounts[oppId] = (opponentCounts[oppId]||0)+1;
+      if(!opponentMatchDetails[oppId]) opponentMatchDetails[oppId] = [];
+      opponentMatchDetails[oppId].push({
+        stallName: m.stallName,
+        time: m.time,
+        result: isA ? m.resultA : m.resultB
+      });
       return {
         time: m.time, stallId: m.stallId, stallName: m.stallName,
         opponentId: oppId, opponentName: oppName,
@@ -134,7 +178,7 @@ function enrichTeams(teams, matches){
     return {
       id: t.id, name: t.name,
       coins: { past: Number(t.past), present: Number(t.present), future: Number(t.future) },
-      playedStalls, opponentCounts, matchLog
+      playedStalls, opponentCounts, opponentMatchDetails, matchLog
     };
   });
 }
@@ -161,6 +205,55 @@ function coinValue(team){
 }
 function wins(team){ return team.matchLog.filter(m=>m.result==='Win').length; }
 
+// ---------- H2H DISCREPANCY HELPERS ----------
+/**
+ * Returns an HTML string describing the head-to-head history between teamA and teamB.
+ * Used both in the conductor live preview and in the standalone discrepancy checker.
+ */
+function buildH2HHtml(teamA, teamB){
+  const count = (teamA.opponentCounts[teamB.id] || 0);
+  const details = (teamA.opponentMatchDetails[teamB.id] || []);
+  const blocked = count >= MAX_ENCOUNTERS;
+  const almostBlocked = count === MAX_ENCOUNTERS - 1;
+
+  const pct = Math.min(100, Math.round((count / MAX_ENCOUNTERS) * 100));
+  const fillColor = blocked ? 'var(--loss)' : almostBlocked ? 'var(--past)' : 'var(--win)';
+  const countClass = blocked ? 'err-count' : almostBlocked ? 'warn-count' : 'ok-count';
+
+  let html = `
+    <div class="h2h-bar">
+      <span class="h2h-count ${countClass}">${count}</span>
+      <div style="flex:1;">
+        <div class="progress-track">
+          <div class="progress-fill" style="width:${pct}%;background:${fillColor};"></div>
+        </div>
+        <div class="h2h-label">${count} of ${MAX_ENCOUNTERS} allowed encounters used</div>
+      </div>
+    </div>`;
+
+  if(details.length){
+    html += `<table style="margin-top:6px;">
+      <thead><tr><th>#</th><th>Stall / Game</th><th>Result for ${teamA.name}</th><th>Time</th></tr></thead>
+      <tbody>
+      ${details.map((d,i)=>`
+        <tr>
+          <td>${i+1}</td>
+          <td>${d.stallName}</td>
+          <td><span class="pill ${d.result.includes('Win')?'win':d.result.includes('Loss')?'loss':'tie'}">${d.result}</span></td>
+          <td>${new Date(d.time).toLocaleTimeString()}</td>
+        </tr>`).join('')}
+      </tbody></table>`;
+  }
+
+  if(blocked){
+    html += `<div class="msg err" style="margin-top:10px;">⚠ These two teams have already competed <strong>${MAX_ENCOUNTERS} times</strong> — they <strong>cannot compete further</strong>.</div>`;
+  } else if(almostBlocked){
+    html += `<div class="msg warn" style="margin-top:10px;">⚠ One encounter left — this will be their final allowed match.</div>`;
+  }
+
+  return html;
+}
+
 // ---------- NAV ----------
 function renderNav(){
   const nav = document.getElementById('nav');
@@ -186,14 +279,16 @@ async function renderMain(){
     return;
   }
   main.innerHTML = '<div class="empty">Loading…</div>';
-  if(activeTab==='setup') return renderSetup(main);
-  if(activeTab==='conductor') return renderConductor(main);
-  if(activeTab==='exchange') return renderExchange(main);
-  if(activeTab==='team') return renderTeamView(main);
+  if(activeTab==='setup')       return renderSetup(main);
+  if(activeTab==='conductor')   return renderConductor(main);
+  if(activeTab==='exchange')    return renderExchange(main);
+  if(activeTab==='team')        return renderTeamView(main);
   if(activeTab==='leaderboard') return renderLeaderboard(main);
 }
 
-// ---------- ADMIN SETUP ----------
+// ============================================================
+//  ADMIN SETUP
+// ============================================================
 async function renderSetup(main){
   if(!isAdminUnlocked){
     main.innerHTML = `
@@ -221,9 +316,12 @@ async function renderSetup(main){
   }
 
   main.innerHTML = `
+    <!-- ========= ADD TEAM ========= -->
     <div class="card">
       <h2>Add a Team</h2>
-      <div class="sub">Starting coins default to 9 Past / 6 Present / 4 Future per the rules — adjust if needed.</div>
+      <div class="sub">Starting coins default to ${DEFAULT_START.past} Past / ${DEFAULT_START.present} Present / ${DEFAULT_START.future} Future per the rules — adjust if needed.</div>
+
+      <!-- Manual entry -->
       <div class="row"><div><label>Team name</label><input id="teamName" placeholder="e.g. Team Falcon"></div></div>
       <div class="row">
         <div><label>Past</label><input id="startPast" type="number" value="${DEFAULT_START.past}" min="0"></div>
@@ -232,6 +330,30 @@ async function renderSetup(main){
       </div>
       <button class="btn" id="addTeamBtn">Add Team</button>
       <div id="setupMsg"></div>
+
+      <hr class="divider">
+
+      <!-- Excel import -->
+      <h2 style="font-size:0.95rem; margin-bottom:4px;">📥 Import Participants from Excel</h2>
+      <div class="sub">
+        Upload an <code>.xlsx</code> / <code>.xls</code> file. The app reads these columns from the first sheet:
+        <strong>«${IMPORT_FIELDS.name}»</strong> (required),
+        <strong>«${IMPORT_FIELDS.past}»</strong>,
+        <strong>«${IMPORT_FIELDS.present}»</strong>,
+        <strong>«${IMPORT_FIELDS.future}»</strong> (optional, defaults to ${DEFAULT_START.past}/${DEFAULT_START.present}/${DEFAULT_START.future}).
+        Column names are set by <code>IMPORT_FIELDS</code> in the script and can be changed by a developer.
+      </div>
+      <label>Excel file</label>
+      <input type="file" id="importFile" accept=".xlsx,.xls,.csv">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="btn secondary" id="previewImportBtn" style="margin-top:10px;">Preview</button>
+        <button class="btn" id="importAllBtn" style="margin-top:10px;" disabled>Import All</button>
+      </div>
+      <div id="importPreviewArea"></div>
+      <div id="importMsg"></div>
+
+      <hr class="divider">
+
       <table><thead><tr><th>Team</th><th>Coins (P/Pr/F)</th><th></th></tr></thead>
       <tbody>
       ${teams.length? teams.map(t=>`
@@ -241,6 +363,7 @@ async function renderSetup(main){
       </tbody></table>
     </div>
 
+    <!-- ========= ADD STALL ========= -->
     <div class="card">
       <h2>Add a Stall</h2>
       <div class="sub">21 stalls total, split across Past / Present / Future categories.</div>
@@ -259,26 +382,30 @@ async function renderSetup(main){
       </tbody></table>
     </div>
 
+    <!-- ========= EXPORT ========= -->
     <div class="card">
       <h2>Backup / Export</h2>
-      <div class="sub">Every action already writes straight to your Google Sheet — that's your live backup. This button also gives you a point-in-time .xlsx snapshot to keep locally.</div>
+      <div class="sub">Every action already writes straight to your Google Sheet — that's your live backup. This button gives you a point-in-time <code>.xlsx</code> snapshot with all participants, stalls, matches, and leaderboard.</div>
       <button class="btn secondary" id="exportBtn">⬇ Download Excel Backup</button>
       <div id="exportMsg"></div>
     </div>
 
+    <!-- ========= FULL MATCH LOG ========= -->
     <div class="card">
       <h2>Full Match Log</h2>
-      <div class="sub">Every recorded result, from each team's perspective — for audit purposes. The same data lives in the "Matches" tab of your Google Sheet.</div>
+      <div class="sub">Every recorded result — for audit purposes. The same data lives in the "Matches" tab of your Google Sheet.</div>
       <table><thead><tr><th>Time</th><th>Team</th><th>Opponent</th><th>Stall</th><th>Result</th><th>Coins ±</th><th>Conductor</th></tr></thead>
       <tbody id="fullLog"></tbody></table>
     </div>
 
+    <!-- ========= DANGER ZONE ========= -->
     <div class="card">
       <h2>Danger Zone</h2>
       <button class="btn danger" id="resetBtn">Reset All Data</button>
     </div>
   `;
 
+  // ---- Full log ----
   const allLog = [];
   teams.forEach(t=> t.matchLog.forEach(m=> allLog.push({...m, team:t.name})));
   allLog.sort((a,b)=> b.time - a.time);
@@ -288,6 +415,7 @@ async function renderSetup(main){
     <td>${m.coinChange>0?'+':''}${m.coinChange} ${m.coinType}</td><td>${m.conductor||'—'}</td></tr>
   `).join('') : '<tr><td colspan="7" class="empty">No matches recorded yet.</td></tr>';
 
+  // ---- Add Team (manual) ----
   document.getElementById('addTeamBtn').onclick = async ()=>{
     const name = document.getElementById('teamName').value.trim();
     const msg = document.getElementById('setupMsg');
@@ -303,9 +431,89 @@ async function renderSetup(main){
     renderSetup(main);
   };
 
+  // ---- Import: Preview ----
+  let importRows = []; // rows ready to import
+
+  document.getElementById('previewImportBtn').onclick = ()=>{
+    const file = document.getElementById('importFile').files[0];
+    const previewArea = document.getElementById('importPreviewArea');
+    const importMsg = document.getElementById('importMsg');
+    importMsg.innerHTML = '';
+    if(!file){ importMsg.innerHTML = '<div class="msg err">Choose a file first.</div>'; return; }
+
+    const reader = new FileReader();
+    reader.onload = (e)=>{
+      try{
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+        importRows = [];
+        const existingNames = new Set(teams.map(t=>t.name.toLowerCase()));
+
+        const parsed = raw.map(row=>{
+          const name = String(row[IMPORT_FIELDS.name]||'').trim();
+          const past    = Number(row[IMPORT_FIELDS.past])    || DEFAULT_START.past;
+          const present = Number(row[IMPORT_FIELDS.present]) || DEFAULT_START.present;
+          const future  = Number(row[IMPORT_FIELDS.future])  || DEFAULT_START.future;
+          const skip = !name || existingNames.has(name.toLowerCase());
+          if(!skip) importRows.push({ name, past, present, future });
+          return { name: name||'(blank)', past, present, future, skip };
+        });
+
+        if(!parsed.length){
+          previewArea.innerHTML = '<div class="msg warn">No rows found in the file.</div>';
+          document.getElementById('importAllBtn').disabled = true;
+          return;
+        }
+
+        previewArea.innerHTML = `
+          <div class="import-preview">
+            <table>
+              <thead><tr><th>Name</th><th>Past</th><th>Present</th><th>Future</th><th>Status</th></tr></thead>
+              <tbody>
+              ${parsed.map(r=>`
+                <tr class="${r.skip?'import-row-skip':'import-row-ok'}">
+                  <td>${r.name}</td><td>${r.past}</td><td>${r.present}</td><td>${r.future}</td>
+                  <td>${r.skip ? '<span class="muted">Skip (exists / blank)</span>' : '<span style="color:var(--win)">✓ Import</span>'}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+          <div class="muted" style="font-size:0.8rem; margin-top:6px;">${importRows.length} row(s) will be imported · ${parsed.length - importRows.length} skipped</div>`;
+
+        document.getElementById('importAllBtn').disabled = importRows.length === 0;
+      } catch(err){
+        previewArea.innerHTML = `<div class="msg err">Could not read file: ${err.message}</div>`;
+        document.getElementById('importAllBtn').disabled = true;
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  // ---- Import: Bulk add ----
+  document.getElementById('importAllBtn').onclick = async ()=>{
+    const btn = document.getElementById('importAllBtn');
+    const importMsg = document.getElementById('importMsg');
+    if(!importRows.length){ importMsg.innerHTML = '<div class="msg err">Nothing to import.</div>'; return; }
+    btn.disabled = true;
+    btn.textContent = 'Importing…';
+    let done = 0, failed = 0;
+    for(const row of importRows){
+      try{
+        await apiPost('addTeam', row);
+        done++;
+      } catch(e){ failed++; }
+    }
+    importMsg.innerHTML = `<div class="msg ok">Imported ${done} team(s).${failed?` ${failed} failed.`:''}</div>`;
+    importRows = [];
+    renderSetup(main);
+  };
+
+  // ---- Add Stall ----
   document.getElementById('addStallBtn').onclick = async ()=>{
     const name = document.getElementById('stallName').value.trim();
-    const cat = document.getElementById('stallCat').value;
+    const cat  = document.getElementById('stallCat').value;
     const wager = Number(document.getElementById('stallWager').value);
     if(!name || !wager || wager<1) return;
     await apiPost('addStall', { name, category: cat, minWager: wager });
@@ -327,31 +535,48 @@ async function renderSetup(main){
     };
   });
 
+  // ---- Export ----
   document.getElementById('exportBtn').onclick = async ()=>{
     const msg = document.getElementById('exportMsg');
     msg.innerHTML = '<div class="msg ok">Building file…</div>';
     try{
-      const { teams, stalls, matches } = await loadAll();
+      const { teams: t2, stalls: s2, matches: m2 } = await loadAll();
       const wb = XLSX.utils.book_new();
 
-      const teamRows = teams.map(t=>({
+      // Participants sheet (importable format + live stats)
+      const participantRows = t2.map(t=>({
+        [IMPORT_FIELDS.name]:    t.name,
+        [IMPORT_FIELDS.past]:    t.coins.past,
+        [IMPORT_FIELDS.present]: t.coins.present,
+        [IMPORT_FIELDS.future]:  t.coins.future,
+        'Coin Value (Future-eq)': Number(coinValue(t).toFixed(2)),
+        Wins: wins(t),
+        'Stalls Played': t.playedStalls.length
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(participantRows), 'Participants');
+
+      // Teams (legacy / full detail)
+      const teamRows = t2.map(t=>({
         ID: t.id, Name: t.name, Past: t.coins.past, Present: t.coins.present, Future: t.coins.future,
         'Coin Value (Future-eq)': Number(coinValue(t).toFixed(2)),
         Wins: wins(t), 'Stalls Played': t.playedStalls.length
       }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(teamRows), 'Teams');
 
-      const stallRows = stalls.map(s=>({ ID: s.id, Name: s.name, Category: s.category, 'Min Wager': s.minWager }));
+      // Stalls
+      const stallRows = s2.map(s=>({ ID: s.id, Name: s.name, Category: s.category, 'Min Wager': s.minWager }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(stallRows), 'Stalls');
 
-      const matchRows = matches.map(m=>({
+      // Match Log
+      const matchRows = m2.map(m=>({
         Time: new Date(m.time).toLocaleString(), Stall: m.stallName,
         'Team A': m.teamAName, 'Team B': m.teamBName, Wager: m.wager, 'Coin Type': m.coinType,
         'Result A': m.resultA, 'Result B': m.resultB, 'Change A': m.changeA, 'Change B': m.changeB, Conductor: m.conductor
       }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(matchRows), 'Match Log');
 
-      const ranked = [...teams].sort((a,b)=> coinValue(b)-coinValue(a) || wins(b)-wins(a) || b.playedStalls.length-a.playedStalls.length);
+      // Leaderboard
+      const ranked = [...t2].sort((a,b)=> coinValue(b)-coinValue(a) || wins(b)-wins(a) || b.playedStalls.length-a.playedStalls.length);
       const lbRows = ranked.map((t,i)=>({
         Rank: i+1, Team: t.name, 'Coin Value': Number(coinValue(t).toFixed(2)),
         Wins: wins(t), Stalls: t.playedStalls.length, Qualified: i<15 ? 'Yes' : 'No'
@@ -373,15 +598,18 @@ async function renderSetup(main){
   };
 }
 
-// ---------- CONDUCTOR ----------
+// ============================================================
+//  CONDUCTOR
+// ============================================================
 async function renderConductor(main){
   const { teams, stalls, error } = await loadAll();
   if(error){ main.innerHTML = `<div class="card"><div class="msg err">Couldn't reach the Google Sheet: ${error}</div></div>`; return; }
 
   main.innerHTML = `
+    <!-- ========= RECORD MATCH ========= -->
     <div class="card">
       <h2>Record a Match</h2>
-      <div class="sub">Pick the stall, then the two teams. Each team can only play a given stall once, and face the same opponent at most twice.</div>
+      <div class="sub">Pick the stall, then the two teams. Each team can only play a given stall once, and may face the same opponent at most <strong>${MAX_ENCOUNTERS} times</strong> total.</div>
       <label>Stall</label>
       <select id="stallSel"><option value="">— Select stall —</option>
         ${stalls.map(s=>`<option value="${s.id}">${s.name} (${s.category}, min ${s.minWager})</option>`).join('')}
@@ -393,22 +621,39 @@ async function renderConductor(main){
       <label>Conductor initials</label>
       <input id="conductorInit" placeholder="e.g. RS">
       <div id="wagerInfo"></div>
+      <div id="h2hInfo"></div>
       <div class="row" style="margin-top:14px;">
-        <button class="btn" data-outcome="A">Team A Wins</button>
-        <button class="btn" data-outcome="B">Team B Wins</button>
-        <button class="btn secondary" data-outcome="winTie">Winning Tie</button>
-        <button class="btn danger" data-outcome="loseTie">Losing Tie</button>
+        <button class="btn" data-outcome="A" id="outcomeA">Team A Wins</button>
+        <button class="btn" data-outcome="B" id="outcomeB">Team B Wins</button>
+        <button class="btn secondary" data-outcome="winTie" id="outcomeWT">Winning Tie</button>
+        <button class="btn danger" data-outcome="loseTie" id="outcomeLT">Losing Tie</button>
       </div>
       <div id="conductorMsg"></div>
     </div>
+
+    <!-- ========= DISCREPANCY CHECKER ========= -->
+    <div class="card">
+      <h2>🔍 Head-to-Head Discrepancy Check</h2>
+      <div class="sub">Check how many times any two teams have competed, and which stalls/games they played. A warning is shown when teams reach the ${MAX_ENCOUNTERS}-encounter limit.</div>
+      <div class="row">
+        <div><label>Team A</label><select id="dcA"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div>
+        <div><label>Team B</label><select id="dcB"><option value="">— Select —</option>${teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')}</select></div>
+      </div>
+      <div id="dcResult"></div>
+    </div>
   `;
 
+  const outcomeButtons = ['outcomeA','outcomeB','outcomeWT','outcomeLT'].map(id=>document.getElementById(id));
+
+  function getTeamA(){ return teams.find(t=>t.id===document.getElementById('teamASel').value); }
+  function getTeamB(){ return teams.find(t=>t.id===document.getElementById('teamBSel').value); }
   function currentStall(){ return stalls.find(s=>s.id===document.getElementById('stallSel').value); }
+
   function updateWagerInfo(){
     const stall = currentStall();
     const box = document.getElementById('wagerInfo');
-    const a = teams.find(t=>t.id===document.getElementById('teamASel').value);
-    const b = teams.find(t=>t.id===document.getElementById('teamBSel').value);
+    const a = getTeamA();
+    const b = getTeamB();
     if(!stall){ box.innerHTML=''; return; }
     const type = stall.category.toLowerCase();
     let html = `<div class="msg warn" style="background:transparent;border:1px dashed var(--line);color:var(--muted);">
@@ -418,10 +663,50 @@ async function renderConductor(main){
     html += `</div>`;
     box.innerHTML = html;
   }
-  document.getElementById('stallSel').onchange = updateWagerInfo;
-  document.getElementById('teamASel').onchange = updateWagerInfo;
-  document.getElementById('teamBSel').onchange = updateWagerInfo;
 
+  function updateH2HInfo(){
+    const a = getTeamA();
+    const b = getTeamB();
+    const box = document.getElementById('h2hInfo');
+    if(!a || !b || a.id===b.id){ box.innerHTML=''; enableOutcomeButtons(); return; }
+
+    const count = (a.opponentCounts[b.id] || 0);
+    box.innerHTML = `
+      <div style="margin-top:14px; padding:14px; border-radius:10px; border:1px solid var(--line); background:#0f1018;">
+        <div style="font-size:0.78rem; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px;">Head-to-Head History</div>
+        ${buildH2HHtml(a, b)}
+      </div>`;
+
+    if(count >= MAX_ENCOUNTERS){
+      disableOutcomeButtons();
+    } else {
+      enableOutcomeButtons();
+    }
+  }
+
+  function enableOutcomeButtons(){ outcomeButtons.forEach(b=>b.disabled=false); }
+  function disableOutcomeButtons(){ outcomeButtons.forEach(b=>b.disabled=true); }
+
+  document.getElementById('stallSel').onchange = updateWagerInfo;
+  document.getElementById('teamASel').onchange = ()=>{ updateWagerInfo(); updateH2HInfo(); };
+  document.getElementById('teamBSel').onchange = ()=>{ updateWagerInfo(); updateH2HInfo(); };
+
+  // ---- Standalone discrepancy checker ----
+  function updateDcResult(){
+    const dcA = document.getElementById('dcA').value;
+    const dcB = document.getElementById('dcB').value;
+    const res = document.getElementById('dcResult');
+    if(!dcA || !dcB){ res.innerHTML=''; return; }
+    if(dcA===dcB){ res.innerHTML='<div class="msg warn" style="margin-top:10px;">Select two different teams.</div>'; return; }
+    const teamA = teams.find(t=>t.id===dcA);
+    const teamB = teams.find(t=>t.id===dcB);
+    if(!teamA || !teamB){ res.innerHTML=''; return; }
+    res.innerHTML = `<div style="margin-top:14px;">${buildH2HHtml(teamA, teamB)}</div>`;
+  }
+  document.getElementById('dcA').onchange = updateDcResult;
+  document.getElementById('dcB').onchange = updateDcResult;
+
+  // ---- Outcome buttons ----
   main.querySelectorAll('[data-outcome]').forEach(btn=>{
     btn.onclick = async ()=>{
       const msg = document.getElementById('conductorMsg');
@@ -442,8 +727,11 @@ async function renderConductor(main){
       if(teamA.playedStalls.includes(stallId) || teamB.playedStalls.includes(stallId)){
         msg.innerHTML = '<div class="msg err">One of these teams has already played this stall.</div>'; btn.disabled=false; return;
       }
-      if((teamA.opponentCounts[bId]||0) >= 2){
-        msg.innerHTML = '<div class="msg err">These two teams have already faced each other twice — pick different opponents.</div>'; btn.disabled=false; return;
+      // Discrepancy check: enforce MAX_ENCOUNTERS cap
+      const encounterCount = teamA.opponentCounts[bId] || 0;
+      if(encounterCount >= MAX_ENCOUNTERS){
+        msg.innerHTML = `<div class="msg err">⚠ These two teams have already competed <strong>${MAX_ENCOUNTERS} times</strong> — they <strong>cannot compete further</strong>.</div>`;
+        btn.disabled=false; return;
       }
       const type = stall.category.toLowerCase();
       const wager = stall.minWager;
@@ -478,7 +766,9 @@ async function renderConductor(main){
   });
 }
 
-// ---------- EXCHANGE ----------
+// ============================================================
+//  EXCHANGE
+// ============================================================
 async function renderExchange(main){
   const { teams, error } = await loadAll();
   if(error){ main.innerHTML = `<div class="card"><div class="msg err">Couldn't reach the Google Sheet: ${error}</div></div>`; return; }
@@ -512,9 +802,9 @@ async function renderExchange(main){
   }
   function refreshPreview(){
     const from = document.getElementById('exFrom').value;
-    const to = document.getElementById('exTo').value;
-    const amt = Number(document.getElementById('exAmt').value);
-    const box = document.getElementById('exPreview');
+    const to   = document.getElementById('exTo').value;
+    const amt  = Number(document.getElementById('exAmt').value);
+    const box  = document.getElementById('exPreview');
     if(from===to){ box.textContent = 'Choose two different coin types.'; return; }
     const out = amt * RATE[`${from}-${to}`];
     if(!Number.isFinite(out) || !Number.isInteger(out) || out<=0){
@@ -534,8 +824,8 @@ async function renderExchange(main){
     const btn = document.getElementById('exBtn');
     const teamId = document.getElementById('exTeam').value;
     const from = document.getElementById('exFrom').value;
-    const to = document.getElementById('exTo').value;
-    const amt = Number(document.getElementById('exAmt').value);
+    const to   = document.getElementById('exTo').value;
+    const amt  = Number(document.getElementById('exAmt').value);
     if(!teamId){ msg.innerHTML = '<div class="msg err">Select a team.</div>'; return; }
     if(from===to){ msg.innerHTML = '<div class="msg err">Choose two different coin types.</div>'; return; }
     const out = amt*RATE[`${from}-${to}`];
@@ -560,7 +850,9 @@ async function renderExchange(main){
   };
 }
 
-// ---------- TEAM VIEW ----------
+// ============================================================
+//  TEAM VIEW
+// ============================================================
 async function renderTeamView(main){
   const { teams, stalls, error } = await loadAll();
   if(error){ main.innerHTML = `<div class="card"><div class="msg err">Couldn't reach the Google Sheet: ${error}</div></div>`; return; }
@@ -581,6 +873,19 @@ async function renderTeamView(main){
     const value = coinValue(t).toFixed(2);
     const canAffordAny = remaining.some(s=> t.coins[s.category.toLowerCase()] >= s.minWager || value >= s.minWager*(s.category==='Past'?1/3:s.category==='Present'?1/2:1));
     const eliminated = remaining.length>0 && !canAffordAny;
+
+    // Build opponent encounter summary
+    const opponentSummary = Object.entries(t.opponentCounts).map(([oppId, cnt])=>{
+      const opp = teams.find(x=>x.id===oppId);
+      const oppName = opp ? opp.name : oppId;
+      const blocked = cnt >= MAX_ENCOUNTERS;
+      return `<tr>
+        <td>${oppName}</td>
+        <td>${cnt} / ${MAX_ENCOUNTERS}</td>
+        <td>${blocked ? '<span class="pill loss">Blocked</span>' : cnt === MAX_ENCOUNTERS-1 ? '<span class="pill tie">Last match</span>' : '<span class="pill win">OK</span>'}</td>
+      </tr>`;
+    }).join('');
+
     body.innerHTML = `
       <div class="coin-badges">
         <span class="badge past">Past: ${t.coins.past}</span>
@@ -598,13 +903,20 @@ async function renderTeamView(main){
         <td>${m.coinChange>0?'+':''}${m.coinChange} ${m.coinType}</td></tr>
       `).join('') : '<tr><td colspan="4" class="empty">No matches played yet.</td></tr>'}</tbody></table>
 
+      ${Object.keys(t.opponentCounts).length ? `
+      <h2 style="margin-top:18px; font-size:0.95rem;">Opponent Encounter Count</h2>
+      <table><thead><tr><th>Opponent</th><th>Encounters</th><th>Status</th></tr></thead>
+      <tbody>${opponentSummary}</tbody></table>` : ''}
+
       <h2 style="margin-top:18px; font-size:0.95rem;">Stalls Remaining</h2>
       ${remaining.length? remaining.map(s=>`<div class="row" style="margin:0; border-bottom:1px solid var(--line); padding:9px 4px;"><span>${s.name} <span class="tag">${s.category}</span></span></div>`).join('') : '<div class="empty">All stalls attempted.</div>'}
     `;
   };
 }
 
-// ---------- LEADERBOARD ----------
+// ============================================================
+//  LEADERBOARD
+// ============================================================
 async function renderLeaderboard(main){
   const { teams, stalls, error } = await loadAll();
   if(error){ main.innerHTML = `<div class="card"><div class="msg err">Couldn't reach the Google Sheet: ${error}</div></div>`; return; }
